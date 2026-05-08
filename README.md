@@ -1,6 +1,10 @@
-# Qwen3 Embedding 本地运行器
+# Embedding Engine
 
-这个项目用于在本地基于 PyTorch 运行 `Qwen/Qwen3-Embedding-0.6B` 向量模型，并封装成可被其他 Python 工程直接调用的 SDK。
+本地 PyTorch 运行器，集成向量模型和重排序模型，封装为可供其他 Python 工程直接 import 的 SDK，同时提供 CLI 调试工具。
+
+**向量模型**：`Qwen/Qwen3-Embedding-0.6B` — 文本向量化，支持 query/document 双模式编码、维度截断、相似度计算。
+
+**重排序模型**：`BAAI/bge-reranker-v2-m3` — Cross-Encoder 重排序，输入 query + 文档列表，输出按相关性降序排列的结果。
 
 ## 环境要求
 
@@ -24,6 +28,8 @@ pip install -e .
 ```
 
 ## 快速开始
+
+### 向量模型
 
 运行内置示例：
 
@@ -50,77 +56,115 @@ qwen-embed --device cpu similarity `
   --document "Gravity is a force that attracts two bodies towards each other."
 ```
 
+### 重排序模型
+
+对文档按查询相关性重排序：
+
+```powershell
+qwen-embed --device cpu rerank `
+  --query "中国首都是哪里" `
+  --document "北京是中国的首都" `
+  --document "巴黎是法国的首都" `
+  --document "东京是日本的首都"
+```
+
+输出按相关性降序排列的 JSON 结果，每条包含 `index`（原始位置）、`document`（文档文本）、`relevance_score`（相关性分数，越高越相关）。
+
 ## 常用参数
 
-- `--model-id`：模型名称，默认是 `Qwen/Qwen3-Embedding-0.6B`
-- `--device`：运行设备，可选 `auto`、`cpu`、`cuda`
-- `--max-length`：最大分词长度，默认 `2048`
-- `--task-description`：检索任务下 query 使用的指令描述
-- `--output-dimension`：向量截断维度，例如 `256`
-- `--cache-dir`：自定义 Hugging Face 模型缓存目录
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--model-id` | Hugging Face 模型 ID | embedding 子命令默认 `Qwen/Qwen3-Embedding-0.6B`，rerank 子命令默认 `BAAI/bge-reranker-v2-m3` |
+| `--device` | 运行设备，可选 `auto`、`cpu`、`cuda` | `auto` |
+| `--max-length` | 最大分词长度 | embedding 默认 `2048`，rerank 默认 `1024` |
+| `--batch-size` | 每批推理数量 | 不分批 |
+| `--cache-dir` | 自定义模型缓存目录 | 系统默认 |
+| `--task-description` | 检索任务下 query 的指令描述 | 内置默认描述 |
+| `--output-dimension` | 向量截断维度，如 `256` | 不截断 |
 
-## SDK 模块结构
-
-- `config.py`：默认模型与运行配置
-- `contracts/`：输入输出协议对象
-- `core/engine.py`：模型加载、分词、池化、相似度计算
-- `core/service.py`：统一协议到模型层的服务编排
-- `sdk.py`：提供给外部工程直接调用的 SDK 入口
-- `factory.py`：SDK 工厂函数
-- `cli.py`：本地调试命令行工具
-
-## 统一协议
-
-本工程对外暴露统一输入输出协议，供另一个工程直接 import 调用。
-
-输入字段：
-
-- `texts`：必传，待编码文本列表
-- `type`：可选，`query` 或 `document`
-- `model`：非必传；为空时默认使用本地 `Qwen/Qwen3-Embedding-0.6B`
-- `output_dimension`：可选，输出维度截断
-- `normalized`：是否归一化
-
-输出字段：
-
-- `embeddings`
-- `dimension`
-- `model_name`
-- `normalized`
-- `usage`
+注意：全局参数必须放在子命令前面，例如 `qwen-embed --device cpu embed --text "你好"`。
 
 ## 在其他工程中调用
+
+### 向量编码
 
 ```python
 from embedding_engine import create_embedding_sdk
 
 sdk = create_embedding_sdk(device="cpu")
 
+# 便捷方法
 result = sdk.embed_texts(
     texts=["中国首都是北京", "北京是中国首都"],
     type="document",
     output_dimension=128,
 )
+print(result.dimension)       # 128
+print(len(result.embeddings)) # 2
 
-print(result.model_name)
-print(result.dimension)
-print(result.usage)
-print(len(result.embeddings))
+# 或传协议对象 / dict
+result = sdk.embed({"texts": ["你好"], "type": "query"})
 ```
 
-如果你想直接传统一协议对象：
+### 重排序
 
 ```python
-from embedding_engine import EmbeddingRequest, create_embedding_sdk
+from embedding_engine import create_reranker_sdk
 
-sdk = create_embedding_sdk()
-request = EmbeddingRequest(
-    texts=["中国首都是北京"],
-    type="query",
-    model=None,
-    output_dimension=256,
+sdk = create_reranker_sdk(device="cpu")
+
+# 便捷方法
+result = sdk.rerank_documents(
+    query="什么是机器学习？",
+    documents=[
+        "机器学习是人工智能的一个分支。",
+        "巴黎是法国的首都。",
+        "ML models learn patterns from data.",
+    ],
+    top_n=2,
 )
-result = sdk.embed(request)
+for r in result.results:
+    print(f"score={r.relevance_score:.2f} | {r.document}")
+
+# 或传协议对象 / dict
+result = sdk.rerank({"query": "你好", "documents": ["世界"]})
+```
+
+### 模型预加载
+
+默认惰性加载（首次调用时才加载模型），可通过 `preload` 提前加载：
+
+```python
+sdk = create_embedding_sdk(device="cpu", preload=True)
+sdk = create_reranker_sdk(device="cpu", preload=True)
+
+# 或创建后手动调用
+sdk.preload()
+```
+
+### 分批推理
+
+文本量大时设置 `batch_size` 避免内存或显存溢出：
+
+```python
+sdk = create_embedding_sdk(device="cuda", batch_size=16)
+sdk = create_reranker_sdk(device="cuda", batch_size=32)
+```
+
+## SDK 模块结构
+
+```
+src/embedding_engine/
+├── config.py              EngineConfig / RerankerConfig 数据类与默认常量
+├── schemas.py             Pydantic 协议对象（Request / Response / Result / UsageInfo）
+├── engine/
+│   ├── model.py           EmbeddingEngine — 向量模型加载、分词、池化、归一化、相似度
+│   ├── pooling.py         last_token_pool — 左侧 padding + 最后一个有效 token
+│   ├── service.py         EmbeddingService — 协议映射、引擎缓存
+│   ├── reranker.py        RerankerEngine — 重排序模型加载、query-doc 对推理
+│   └── reranker_service.py RerankerService — 协议映射、引擎缓存
+├── sdk.py                 EmbeddingSDK + RerankerSDK + 工厂函数
+└── cli.py                 argparse CLI（demo / embed / similarity / rerank）
 ```
 
 ## 缓存位置
@@ -128,10 +172,6 @@ result = sdk.embed(request)
 如果未显式指定 `--cache-dir`、`HF_HOME` 或 `HF_HUB_CACHE`，模型会默认下载到：
 
 `C:\Users\你的用户名\.cache\huggingface\hub`
-
-本机当前默认缓存根目录为：
-
-`C:\Users\zsq51\.cache\huggingface\hub`
 
 ## 编码说明
 
