@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "embedding-engine"
+version = "0.1.0"
+description = "Local PyTorch runner for Qwen3-Embedding-0.6B"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.3.0",
+    "transformers>=4.51.0",
+    "accelerate>=0.31.0",
+    "safetensors>=0.4.3",
+    "pydantic>=2.9.0",
+]
+
+[project.scripts]
+qwen-embed = "embedding_engine.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
