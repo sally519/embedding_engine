@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from .config import DEFAULT_MODEL_ID, EngineConfig
-from .schemas import EmbeddingRequest, EmbeddingResponse
+from .config import DEFAULT_MODEL_ID, DEFAULT_RERANKER_MODEL_ID, EngineConfig, RerankerConfig
+from .schemas import EmbeddingRequest, EmbeddingResponse, RerankRequest, RerankResponse
 from .engine.service import EmbeddingService
+from .engine.reranker_service import RerankerService
 
 
 class EmbeddingSDK:
@@ -220,6 +221,175 @@ def create_embedding_sdk(
         sdk.preload()
     """
     sdk = EmbeddingSDK(
+        model=model,
+        device=device,
+        max_length=max_length,
+        cache_dir=cache_dir,
+        batch_size=batch_size,
+    )
+    if preload:
+        sdk.preload()
+    return sdk
+
+
+# ============================================================
+# 重排序 SDK
+# ============================================================
+
+
+class RerankerSDK:
+    """面向外部工程的重排序 SDK 主入口。
+
+    与 :class:`EmbeddingSDK` 对称设计。内部创建 :class:`RerankerService`，
+    由服务层管理模型加载和推理。模型在首次调用时惰性加载。
+
+    典型用法::
+
+        from embedding_engine import create_reranker_sdk
+
+        sdk = create_reranker_sdk(device="cpu")
+        result = sdk.rerank_documents(
+            query="中国首都是哪里",
+            documents=["北京是中国的首都", "巴黎是法国的首都"],
+        )
+        for r in result.results:
+            print(f"{r.relevance_score:.2f} | {r.document}")
+
+    Args:
+        model: 默认模型 ID，默认 ``BAAI/bge-reranker-v2-m3``。
+        device: 推理设备，``"auto"``（自动检测）、``"cpu"`` 或 ``"cuda"``。
+        max_length: 分词器最大序列长度，默认 1024。
+        cache_dir: Hugging Face 模型缓存目录，为 None 时使用系统默认路径。
+        batch_size: 每批推理的 query-doc 对数，为 None 时不分批。
+
+    Attributes:
+        config: 重排序引擎全局配置实例。
+        service: 底层服务实例。
+    """
+
+    def __init__(
+        self,
+        *,
+        model: str = DEFAULT_RERANKER_MODEL_ID,
+        device: str = "auto",
+        max_length: int = 1024,
+        cache_dir: str | None = None,
+        batch_size: int | None = None,
+    ) -> None:
+        self.config = RerankerConfig(
+            default_model_id=model,
+            device=device,
+            max_length=max_length,
+            cache_dir=cache_dir,
+            batch_size=batch_size,
+        )
+        self.service = RerankerService(self.config)
+
+    def preload(self) -> None:
+        """提前加载重排序模型到内存或显存。
+
+        调用此方法可以提前完成模型下载、分词器初始化和权重加载，
+        避免首次重排序请求出现明显延迟。适合在服务启动阶段调用。
+        """
+        self.service.preload()
+
+    def rerank(self, request: RerankRequest | dict) -> RerankResponse:
+        """通过统一协议对象进行重排序。
+
+        接受 :class:`RerankRequest` 协议对象或等价的 ``dict`` 字典，
+        执行重排序后返回 :class:`RerankResponse`。
+
+        Args:
+            request: 重排序请求，支持两种形式：
+                - :class:`RerankRequest` 实例
+                - ``dict``：如 ``{"query": "...", "documents": ["..."]}``
+
+        Returns:
+            :class:`RerankResponse` 协议对象，结果按相关性降序排列。
+        """
+        if isinstance(request, dict):
+            request = RerankRequest(**request)
+        return self.service.rerank(request)
+
+    def rerank_documents(
+        self,
+        query: str,
+        documents: list[str],
+        *,
+        model: str | None = None,
+        top_n: int | None = None,
+    ) -> RerankResponse:
+        """便捷方法：通过关键字参数直接对文档重排序。
+
+        无需手动构造 :class:`RerankRequest` 对象，直接传入查询和文档列表即可。
+
+        Args:
+            query: 查询文本。
+            documents: 待排序的文档列表。
+            model: 模型 ID，为 None 时使用默认模型。
+            top_n: 仅返回前 N 个结果。为 None 时返回全部。
+
+        Returns:
+            :class:`RerankResponse` 协议对象。
+
+        Example::
+
+            sdk = create_reranker_sdk()
+            response = sdk.rerank_documents(
+                query="什么是机器学习？",
+                documents=[
+                    "机器学习是人工智能的一个分支。",
+                    "巴黎是法国的首都。",
+                ],
+                top_n=1,
+            )
+            print(response.results[0].document)  # "机器学习是人工智能的一个分支。"
+        """
+        request = RerankRequest(
+            query=query,
+            documents=documents,
+            model=model,
+            top_n=top_n,
+        )
+        return self.service.rerank(request)
+
+
+def create_reranker_sdk(
+    *,
+    model: str = DEFAULT_RERANKER_MODEL_ID,
+    device: str = "auto",
+    max_length: int = 1024,
+    cache_dir: str | None = None,
+    batch_size: int | None = None,
+    preload: bool = False,
+) -> RerankerSDK:
+    """创建重排序 SDK 实例的工厂函数。
+
+    与 :func:`create_embedding_sdk` 对称设计，用于创建重排序 SDK。
+    默认使用 ``BAAI/bge-reranker-v2-m3`` 模型。
+
+    Args:
+        model: 默认模型 ID，默认 ``BAAI/bge-reranker-v2-m3``。
+        device: 推理设备，可选 ``"auto"``、``"cpu"``、``"cuda"``。
+        max_length: 分词器最大序列长度，默认 1024。
+        cache_dir: 模型缓存目录，为 None 时使用系统默认路径。
+        batch_size: 每批推理的 query-doc 对数，为 None 时不分批。
+        preload: 是否在创建时立即加载模型，默认 False。
+
+    Returns:
+        已初始化的 :class:`RerankerSDK` 实例。
+
+    Example::
+
+        from embedding_engine import create_reranker_sdk
+
+        # 惰性加载
+        sdk = create_reranker_sdk()
+
+        # 立即加载
+        sdk = create_reranker_sdk(device="cpu", preload=True)
+    """
+    sdk = RerankerSDK(
         model=model,
         device=device,
         max_length=max_length,

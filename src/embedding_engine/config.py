@@ -37,3 +37,33 @@ class EngineConfig:
     max_length: int = 2048
     cache_dir: str | None = None
     batch_size: int | None = None
+
+
+# 默认使用的重排序模型 ID，对应 BAAI/bge-reranker-v2-m3。
+DEFAULT_RERANKER_MODEL_ID = "BAAI/bge-reranker-v2-m3"
+
+# bge-reranker-v2-m3 模型微调时使用的最大序列长度。
+DEFAULT_RERANKER_MAX_LENGTH = 1024
+
+
+@dataclass
+class RerankerConfig:
+    """重排序引擎全局配置。
+
+    与 :class:`EngineConfig` 对称设计，但使用独立的默认模型和序列长度。
+    bge-reranker-v2-m3 基于 XLMRoberta 架构，微调时 max_length 为 1024。
+
+    Attributes:
+        default_model_id: 默认重排序模型 ID。
+            默认为 ``BAAI/bge-reranker-v2-m3``。
+        device: 推理设备。可选 ``"auto"``（自动检测）、``"cpu"``、``"cuda"``。
+        max_length: 分词器最大序列长度，默认 1024。
+        cache_dir: Hugging Face 模型缓存目录。为 None 时使用系统默认路径。
+        batch_size: 每批推理的 query-doc 对数。为 None 时不分批。
+    """
+
+    default_model_id: str = DEFAULT_RERANKER_MODEL_ID
+    device: str = "auto"
+    max_length: int = DEFAULT_RERANKER_MAX_LENGTH
+    cache_dir: str | None = None
+    batch_size: int | None = None

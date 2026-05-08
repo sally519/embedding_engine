@@ -128,3 +128,97 @@ class EmbeddingResponse(BaseModel):
     model_name: str
     normalized: bool
     usage: UsageInfo
+
+
+# ============================================================
+# 重排序协议
+# ============================================================
+
+
+class RerankRequest(BaseModel):
+    """统一重排序请求协议。
+
+    输入一条查询文本和一组待排序的文档，返回按相关性降序排列的结果。
+
+    Attributes:
+        query: 查询文本，必须非空。
+        documents: 待重排序的文档列表，至少包含一条文档。
+        model: 模型名称，非必传。为 None 时使用默认 ``BAAI/bge-reranker-v2-m3``。
+        top_n: 仅返回前 N 个结果。为 None 时返回全部结果，按相关性降序排列。
+    """
+
+    query: str = Field(..., min_length=1, description="查询文本。")
+    documents: list[str] = Field(
+        ..., min_length=1, description="待重排序的文档列表。"
+    )
+    model: str | None = Field(
+        default=None,
+        description="模型名称，非必传；为空时默认使用 bge-reranker-v2-m3。",
+    )
+    top_n: int | None = Field(
+        default=None,
+        ge=1,
+        description="返回前 N 个结果。为 None 时返回全部。",
+    )
+
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, query: str) -> str:
+        """校验 query 字段，去除首尾空白后检查非空。"""
+        cleaned = query.strip()
+        if not cleaned:
+            raise ValueError("query 不能为空字符串")
+        return cleaned
+
+    @field_validator("documents")
+    @classmethod
+    def validate_documents(cls, documents: list[str]) -> list[str]:
+        """校验 documents 字段，去除每条文档首尾空白后检查无空字符串。"""
+        cleaned = [doc.strip() for doc in documents]
+        if any(not doc for doc in cleaned):
+            raise ValueError("documents 中不能包含空字符串")
+        return cleaned
+
+
+class RerankResult(BaseModel):
+    """单条重排序结果。
+
+    Attributes:
+        index: 该文档在原始 ``documents`` 列表中的位置索引。
+        document: 原始文档文本。
+        relevance_score: 相关性分数（原始 logit），值越大表示越相关。
+            典型范围约 -11 到 +7，不需要归一化即可用于排序。
+    """
+
+    index: int
+    document: str
+    relevance_score: float
+
+
+class RerankUsageInfo(BaseModel):
+    """重排序调用用量统计信息。
+
+    Attributes:
+        input_count: 输入的 query-doc 对数（等于 documents 列表长度）。
+        prompt_tokens: 输入 token 总数。
+        total_tokens: 总 token 数。
+    """
+
+    input_count: int
+    prompt_tokens: int
+    total_tokens: int
+
+
+class RerankResponse(BaseModel):
+    """统一重排序响应协议。
+
+    Attributes:
+        model_name: 实际使用的模型 ID。
+        results: 重排序结果列表，按 ``relevance_score`` 降序排列。
+            如果请求指定了 ``top_n``，列表长度不超过 ``top_n``。
+        usage: 本次调用的用量统计信息。
+    """
+
+    model_name: str
+    results: list[RerankResult]
+    usage: RerankUsageInfo

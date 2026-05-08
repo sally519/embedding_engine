@@ -4,8 +4,10 @@ import argparse
 import json
 from typing import Sequence
 
-from .config import DEFAULT_MODEL_ID, DEFAULT_TASK_DESCRIPTION
+from .config import DEFAULT_MODEL_ID, DEFAULT_RERANKER_MODEL_ID, DEFAULT_TASK_DESCRIPTION
 from .engine.model import EmbeddingEngine
+from .engine.reranker_service import RerankerService
+from .schemas import RerankRequest
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -14,15 +16,17 @@ def build_parser() -> argparse.ArgumentParser:
     定义了 ``qwen-embed`` 命令的完整参数结构：
 
     - **全局参数**（必须放在子命令前面）：
-        - ``--model-id``：Hugging Face 模型 ID，默认 ``Qwen/Qwen3-Embedding-0.6B``
+        - ``--model-id``：Hugging Face 模型 ID
         - ``--device``：推理设备，可选 ``auto``、``cpu``、``cuda``
-        - ``--max-length``：分词器最大序列长度，默认 2048
+        - ``--max-length``：分词器最大序列长度
         - ``--cache-dir``：模型缓存目录
+        - ``--batch-size``：每批推理数量
 
     - **子命令**：
-        - ``demo``：运行内置相似度示例，验证模型推理链路
+        - ``demo``：运行内置相似度示例，验证向量模型推理链路
         - ``embed``：生成文本向量
         - ``similarity``：计算查询与文档的相似度矩阵
+        - ``rerank``：对文档按查询相关性重排序
 
     Returns:
         配置好的 ``ArgumentParser`` 实例。
@@ -30,10 +34,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run Qwen3-Embedding-0.6B locally with PyTorch."
     )
+    # 全局 --model-id 默认为 None，各子命令按需 fallback 到自己的默认模型。
     parser.add_argument(
         "--model-id",
-        default=DEFAULT_MODEL_ID,
-        help="Hugging Face model id.",
+        default=None,
+        help="Hugging Face model id. Defaults depend on the subcommand.",
     )
     parser.add_argument(
         "--device",
@@ -44,8 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-length",
         type=int,
-        default=2048,
-        help="Tokenizer max length.",
+        default=None,
+        help="Tokenizer max length. Defaults depend on the subcommand.",
     )
     parser.add_argument(
         "--cache-dir",
@@ -114,6 +119,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional output dimension slice, e.g. 256.",
     )
 
+    rerank = subparsers.add_parser(
+        "rerank", help="Rerank documents by relevance to a query."
+    )
+    rerank.add_argument(
+        "--query",
+        required=True,
+        help="Query text for reranking.",
+    )
+    rerank.add_argument(
+        "--document",
+        action="append",
+        required=True,
+        help="Document text. Repeat for multiple documents.",
+    )
+    rerank.add_argument(
+        "--top-n",
+        type=int,
+        default=None,
+        help="Return only top N results.",
+    )
+
     return parser
 
 
@@ -122,12 +148,6 @@ def run_demo(engine: EmbeddingEngine, task_description: str) -> int:
 
     使用一组预定义的查询和文档，分别编码后计算相似度矩阵。
     主要用于快速验证模型加载、推理、池化、相似度计算的完整链路是否正常。
-
-    输出内容包含三个部分：
-    - 查询文本列表（JSON）
-    - 文档文本列表（JSON）
-    - 查询与文档之间的相似度矩阵（JSON），``scores[i][j]`` 表示第 i 个查询
-      与第 j 个文档的余弦相似度
 
     Args:
         engine: 已加载模型的编码引擎实例。
@@ -172,14 +192,11 @@ def run_embed(
 ) -> int:
     """生成文本向量并输出到标准输出。
 
-    将输入文本编码为向量后，以 JSON 数组形式输出。
-    可选输出向量矩阵的形状（batch_size, dimension），便于调试确认维度。
-
     Args:
         engine: 已加载模型的编码引擎实例。
-        texts: 待编码文本序列，来自 ``--text`` 参数（可重复使用）。
+        texts: 待编码文本序列。
         output_dimension: 输出维度截断值。为 None 时不截断。
-        show_shape: 是否在输出向量前先打印矩阵形状，如 ``[2, 1024]``。
+        show_shape: 是否打印矩阵形状。
 
     Returns:
         退出码，0 表示成功。
@@ -200,17 +217,12 @@ def run_similarity(
 ) -> int:
     """计算查询与文档之间的相似度矩阵并输出。
 
-    分别对查询侧和文档侧进行编码，然后计算两两之间的余弦相似度。
-    输出为 JSON 格式的二维数组，``result[i][j]`` 表示第 i 个查询
-    与第 j 个文档的相似度分数，范围 ``[-1, 1]``（归一化前提下）。
-
     Args:
         engine: 已加载模型的编码引擎实例。
-        queries: 查询文本序列，来自 ``--query`` 参数。
-        documents: 文档文本序列，来自 ``--document`` 参数。
-        task_description: 检索任务描述，用于查询侧的 instruction 拼接。
-        output_dimension: 输出维度截断值，同时应用于查询和文档侧。
-            为 None 时不截断。
+        queries: 查询文本序列。
+        documents: 文档文本序列。
+        task_description: 检索任务描述。
+        output_dimension: 输出维度截断值。
 
     Returns:
         退出码，0 表示成功。
@@ -232,15 +244,53 @@ def run_similarity(
     return 0
 
 
+def run_rerank(
+    service: RerankerService,
+    query: str,
+    documents: Sequence[str],
+    top_n: int | None,
+) -> int:
+    """对文档按查询相关性重排序并输出。
+
+    将查询和文档送入 Cross-Encoder 模型，输出按相关性降序排列的结果。
+    输出为 JSON 格式，包含模型名称和排序结果列表。
+
+    Args:
+        service: 重排序服务实例。
+        query: 查询文本。
+        documents: 文档文本序列。
+        top_n: 仅返回前 N 个结果。
+
+    Returns:
+        退出码，0 表示成功。
+    """
+    request = RerankRequest(
+        query=query,
+        documents=list(documents),
+        top_n=top_n,
+    )
+    response = service.rerank(request)
+    output = {
+        "model": response.model_name,
+        "results": [
+            {
+                "index": r.index,
+                "document": r.document,
+                "relevance_score": r.relevance_score,
+            }
+            for r in response.results
+        ],
+    }
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+    return 0
+
+
 def main() -> int:
     """CLI 主入口函数。
 
-    解析命令行参数，初始化模型引擎，然后根据子命令分发到对应的处理函数。
-
-    执行流程：
-    1. 解析全局参数和子命令
-    2. 根据全局参数初始化 :class:`EmbeddingEngine`（所有子命令共用）
-    3. 根据子命令名称分发到 ``run_demo`` / ``run_embed`` / ``run_similarity``
+    解析命令行参数，根据子命令分发到对应的处理函数。
+    rerank 子命令使用独立的 RerankerService 和默认重排序模型；
+    其余子命令共用 EmbeddingEngine。
 
     Returns:
         退出码：0 表示成功，2 表示参数错误。
@@ -248,11 +298,25 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    # 统一初始化模型引擎，后续各个子命令共用同一套加载逻辑。
+    # rerank 子命令使用独立的重排序引擎和配置。
+    if args.command == "rerank":
+        from .config import RerankerConfig
+
+        config = RerankerConfig(
+            default_model_id=args.model_id or DEFAULT_RERANKER_MODEL_ID,
+            device=args.device,
+            max_length=args.max_length or 1024,
+            cache_dir=args.cache_dir,
+            batch_size=args.batch_size,
+        )
+        service = RerankerService(config)
+        return run_rerank(service, args.query, args.document, args.top_n)
+
+    # embedding 子命令使用向量引擎。
     engine = EmbeddingEngine(
-        model_id=args.model_id,
+        model_id=args.model_id or DEFAULT_MODEL_ID,
         device=args.device,
-        max_length=args.max_length,
+        max_length=args.max_length or 2048,
         cache_dir=args.cache_dir,
         batch_size=args.batch_size,
     )
