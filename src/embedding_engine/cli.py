@@ -52,6 +52,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional Hugging Face cache directory.",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Number of texts per inference batch. None means no batching.",
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -248,6 +254,7 @@ def main() -> int:
         device=args.device,
         max_length=args.max_length,
         cache_dir=args.cache_dir,
+        batch_size=args.batch_size,
     )
 
     if args.command == "demo":

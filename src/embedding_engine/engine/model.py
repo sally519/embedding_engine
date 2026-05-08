@@ -73,7 +73,7 @@ class EmbeddingEngine:
 
     典型用法::
 
-        engine = EmbeddingEngine(device="cpu")
+        engine = EmbeddingEngine(device="cpu", batch_size=8)
         result = engine.embed(["你好世界"])
         print(result.embeddings.shape)  # torch.Size([1, 1024])
 
@@ -82,11 +82,14 @@ class EmbeddingEngine:
         device: 推理设备，``"auto"``（自动检测）、``"cpu"`` 或 ``"cuda"``。
         max_length: 分词器最大序列长度，超出部分会被截断。默认 2048。
         cache_dir: Hugging Face 模型缓存目录。为 None 时使用系统默认路径。
+        batch_size: 每批送入模型的文本条数。文本量大时自动按此值分批推理，
+            避免一次性占满内存或显存。为 None 时不分批，一次性全部处理。
 
     Attributes:
         model_id: 实际使用的模型 ID。
         device: 实际使用的 ``torch.device`` 对象。
         max_length: 分词器最大序列长度。
+        batch_size: 每批推理的文本条数。
         tokenizer: Hugging Face 分词器实例，配置为左侧 padding。
         model: Hugging Face 模型实例，已加载到指定设备并处于 eval 模式。
     """
@@ -97,10 +100,12 @@ class EmbeddingEngine:
         device: str = "auto",
         max_length: int = 2048,
         cache_dir: str | None = None,
+        batch_size: int | None = None,
     ) -> None:
         self.model_id = model_id
         self.device = self._resolve_device(device)
         self.max_length = max_length
+        self.batch_size = batch_size
 
         # Qwen3 Embedding 推荐使用左侧 padding，便于最后一个有效 token 池化。
         # 左侧 padding 意味着 padding token 放在序列左侧，有效 token 靠右排列，
@@ -144,11 +149,16 @@ class EmbeddingEngine:
         *,
         normalize: bool = True,
         output_dimension: int | None = None,
+        batch_size: int | None = None,
     ) -> EmbeddingResult:
         """对文本列表进行向量编码。
 
         完整流程：分词 -> 移入设备 -> 模型前向推理 -> last-token 池化 ->
         可选维度截断 -> 可选 L2 归一化。
+
+        当文本数量较多时，按 ``batch_size`` 分批推理，避免一次性占满
+        内存或显存。每批独立完成分词、推理、池化和归一化后，
+        将各批向量拼接为一个完整张量返回。
 
         推理过程使用 ``torch.inference_mode()`` 上下文管理器，
         禁用梯度计算以节省显存和加速推理。
@@ -162,6 +172,9 @@ class EmbeddingEngine:
                 默认为 True。
             output_dimension: 输出维度截断值。为 None 时输出模型原始维度；
                 指定后只取前 N 维，适用于需要降维以节省存储空间的场景。
+            batch_size: 每批推理的文本条数。为 None 时使用引擎初始化时的
+                ``self.batch_size``；如果仍为 None 则一次性全部处理。
+                显式传入可覆盖引擎默认值，适合某次调用需要特殊批量的场景。
 
         Returns:
             :class:`EmbeddingResult` 对象，包含编码后的向量张量和原始输入文本。
@@ -171,14 +184,61 @@ class EmbeddingEngine:
 
         Example::
 
-            engine = EmbeddingEngine(device="cpu")
-            result = engine.embed(["你好", "世界"], output_dimension=128)
-            print(result.embeddings.shape)  # torch.Size([2, 128])
+            engine = EmbeddingEngine(device="cpu", batch_size=8)
+            # 100 条文本会自动分成 13 批（12×8 + 1×4）推理
+            result = engine.embed(["文本"] * 100)
+            print(result.embeddings.shape)  # torch.Size([100, 1024])
+
+            # 或在单次调用时覆盖 batch_size
+            result = engine.embed(["文本"] * 100, batch_size=32)
         """
         text_list = list(texts)
         if not text_list:
             raise ValueError("texts must not be empty")
 
+        # 确定实际使用的批量大小：参数 > 引擎默认 > 不分批。
+        effective_bs = batch_size or self.batch_size
+
+        # 不分批：一次性处理（文本量少或未设置 batch_size 时走这条路径）。
+        if effective_bs is None or len(text_list) <= effective_bs:
+            return self._embed_batch(
+                text_list, normalize=normalize, output_dimension=output_dimension
+            )
+
+        # 分批处理：按 batch_size 切分文本，逐批推理后拼接。
+        all_embeddings: list[Tensor] = []
+        for start in range(0, len(text_list), effective_bs):
+            batch_texts = text_list[start : start + effective_bs]
+            batch_result = self._embed_batch(
+                batch_texts, normalize=normalize, output_dimension=output_dimension
+            )
+            all_embeddings.append(batch_result.embeddings)
+
+        return EmbeddingResult(
+            embeddings=torch.cat(all_embeddings, dim=0),
+            texts=text_list,
+        )
+
+    def _embed_batch(
+        self,
+        text_list: list[str],
+        *,
+        normalize: bool,
+        output_dimension: int | None,
+    ) -> EmbeddingResult:
+        """对单批文本执行编码（内部方法）。
+
+        执行分词、前向推理、池化、维度截断和归一化的完整流程。
+        由 :meth:`embed` 调用，每次只处理一个批次。
+
+        Args:
+            text_list: 当前批次的文本列表。
+            normalize: 是否做 L2 归一化。
+            output_dimension: 维度截断值，为 None 时不截断。
+
+        Returns:
+            当前批次的编码结果。
+        """
         batch_dict = self.tokenizer(
             text_list,
             padding=True,
@@ -212,6 +272,7 @@ class EmbeddingEngine:
         *,
         normalize: bool = True,
         output_dimension: int | None = None,
+        batch_size: int | None = None,
     ) -> EmbeddingResult:
         """对检索查询文本进行向量编码（自动拼接 instruction）。
 
@@ -230,6 +291,7 @@ class EmbeddingEngine:
                 可自定义以适配不同的检索场景（如代码搜索、问答检索等）。
             normalize: 是否对输出向量做 L2 归一化。默认为 True。
             output_dimension: 输出维度截断值。为 None 时不截断。
+            batch_size: 每批推理的文本条数。为 None 时使用引擎默认值。
 
         Returns:
             :class:`EmbeddingResult` 对象，包含编码后的向量张量。
@@ -237,7 +299,7 @@ class EmbeddingEngine:
 
         Example::
 
-            engine = EmbeddingEngine(device="cpu")
+            engine = EmbeddingEngine(device="cpu", batch_size=8)
             result = engine.embed_queries(["中国首都是哪里？"])
             # result.texts[0] == "Instruct: ...\\nQuery:中国首都是哪里？"
         """
@@ -248,6 +310,7 @@ class EmbeddingEngine:
             instructed_queries,
             normalize=normalize,
             output_dimension=output_dimension,
+            batch_size=batch_size,
         )
 
     @staticmethod

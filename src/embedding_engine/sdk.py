@@ -33,6 +33,7 @@ class EmbeddingSDK:
         device: 推理设备，``"auto"``（自动检测）、``"cpu"`` 或 ``"cuda"``。
         max_length: 分词器最大序列长度，默认 2048。
         cache_dir: Hugging Face 模型缓存目录，为 None 时使用系统默认路径。
+        batch_size: 每批推理的文本条数。为 None 时不分批。
 
     Attributes:
         config: 引擎全局配置实例。
@@ -46,14 +47,34 @@ class EmbeddingSDK:
         device: str = "auto",
         max_length: int = 2048,
         cache_dir: str | None = None,
+        batch_size: int | None = None,
     ) -> None:
         self.config = EngineConfig(
             default_model_id=model,
             device=device,
             max_length=max_length,
             cache_dir=cache_dir,
+            batch_size=batch_size,
         )
         self.service = EmbeddingService(self.config)
+
+    def preload(self) -> None:
+        """提前加载模型到内存或显存。
+
+        正常情况下模型在首次调用编码方法时才会加载（惰性初始化）。
+        调用此方法可以提前完成模型下载（如首次运行）、分词器初始化和权重加载，
+        避免首次编码请求出现明显延迟。
+
+        适合在服务启动、应用初始化阶段调用。如果模型已经加载过，此方法不做任何操作。
+
+        Example::
+
+            sdk = create_embedding_sdk(device="cpu")
+            sdk.preload()  # 提前加载，阻塞直到完成
+            # 后续调用不再有首次加载延迟
+            result = sdk.embed_texts(texts=["你好"])
+        """
+        self.service.preload()
 
     def embed(self, request: EmbeddingRequest | dict) -> EmbeddingResponse:
         """通过统一协议对象进行向量编码。
@@ -149,6 +170,8 @@ def create_embedding_sdk(
     device: str = "auto",
     max_length: int = 2048,
     cache_dir: str | None = None,
+    batch_size: int | None = None,
+    preload: bool = False,
 ) -> EmbeddingSDK:
     """创建向量编码 SDK 实例的工厂函数。
 
@@ -159,9 +182,6 @@ def create_embedding_sdk(
     - 未来如果内部实现变更（如切换到异步引擎），只需修改此函数，
       外部调用代码无需改动
     - 所有参数都有合理默认值，最简调用 ``create_embedding_sdk()`` 即可工作
-
-    模型在首次调用编码方法时才会实际加载，创建 SDK 实例本身不会
-    触发模型下载或 GPU 内存占用。
 
     Args:
         model: 默认模型 ID，对应 Hugging Face 上的模型仓库路径。
@@ -175,6 +195,11 @@ def create_embedding_sdk(
         cache_dir: Hugging Face 模型缓存目录。为 None 时使用系统默认路径
             （Windows 通常为 ``C:\\Users\\<用户名>\\.cache\\huggingface\\hub``）。
             可通过此参数将模型缓存到自定义目录，如网络磁盘或本地大容量磁盘。
+        batch_size: 每批推理的文本条数。为 None 时不分批，一次性全部处理；
+            设置后文本量大于此值时自动分批推理，避免内存或显存溢出。
+        preload: 是否在创建时立即加载模型。默认为 False（惰性加载，首次编码时才加载）。
+            设为 True 时会在构造完成后立即下载/加载模型权重，适合在服务启动阶段使用，
+            避免首次请求出现延迟。
 
     Returns:
         已初始化的 :class:`EmbeddingSDK` 实例，可直接调用 ``embed`` 或
@@ -184,21 +209,23 @@ def create_embedding_sdk(
 
         from embedding_engine import create_embedding_sdk
 
-        # 最简用法：全部使用默认值
+        # 惰性加载（默认），首次编码时才加载模型
         sdk = create_embedding_sdk()
 
-        # 指定设备和缓存目录
-        sdk = create_embedding_sdk(device="cuda", cache_dir="D:/models")
+        # 立即加载模型，适合服务启动时调用
+        sdk = create_embedding_sdk(device="cuda", preload=True)
 
-        # 指定输出维度并编码
-        result = sdk.embed_texts(
-            texts=["你好世界"],
-            output_dimension=256,
-        )
+        # 也可以在创建后手动调用 preload()
+        sdk = create_embedding_sdk()
+        sdk.preload()
     """
-    return EmbeddingSDK(
+    sdk = EmbeddingSDK(
         model=model,
         device=device,
         max_length=max_length,
         cache_dir=cache_dir,
+        batch_size=batch_size,
     )
+    if preload:
+        sdk.preload()
+    return sdk

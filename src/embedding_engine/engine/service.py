@@ -50,8 +50,24 @@ class EmbeddingService:
                 device=self.config.device,
                 max_length=self.config.max_length,
                 cache_dir=self.config.cache_dir,
+                batch_size=self.config.batch_size,
             )
         return self._engines[resolved_model_id]
+
+    def preload(self) -> None:
+        """提前加载默认模型到内存/显存。
+
+        正常情况下模型在首次调用 :meth:`embed` 时才会加载（惰性初始化）。
+        调用此方法可以在服务启动阶段就完成模型加载，避免首次请求延迟。
+
+        如果模型已经加载过，此方法不做任何操作。
+
+        Example::
+
+            service = EmbeddingService()
+            service.preload()  # 启动时加载，首次请求不再等待
+        """
+        self.get_engine(None)
 
     def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         """执行向量编码，将请求协议对象转换为响应协议对象。

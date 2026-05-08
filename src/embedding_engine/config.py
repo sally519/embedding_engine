@@ -28,9 +28,12 @@ class EngineConfig:
             默认 2048，与 Qwen3-Embedding-0.6B 模型的推荐值一致。
         cache_dir: Hugging Face 模型缓存目录。为 None 时使用系统默认路径
             （通常为 ``~/.cache/huggingface/hub``）。
+        batch_size: 每批推理的文本条数。为 None 时不分批，一次性全部处理；
+            设置后文本量大于此值时自动分批推理，避免内存或显存溢出。
     """
 
     default_model_id: str = DEFAULT_MODEL_ID
     device: str = "auto"
     max_length: int = 2048
     cache_dir: str | None = None
+    batch_size: int | None = None
